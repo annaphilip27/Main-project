@@ -1,0 +1,372 @@
+import asyncio
+import concurrent.futures
+import time
+import threading
+from typing import Optional, Tuple
+
+import cv2
+import numpy as np
+import pytesseract
+import requests
+import speech_recognition as sr
+from ultralytics import YOLO
+import firebase_admin
+from firebase_admin import credentials, db, exceptions as firebase_exceptions
+import websockets
+
+# Configuration Constants
+ESP32_IP = "ws://192.168.124.132:86"  # WebSocket server IP for ESP32
+CAM_NO = 0
+TESSERACT_PATH = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+FIREBASE_CREDENTIALS = "serviceAccountKey.json"
+FIREBASE_CONFIG = {'databaseURL': 'https://blind-assistant-5665c-default-rtdb.firebaseio.com/'}
+ESP8266_SERVER_URL = "http://192.168.124.251/update"
+DETECTION_TIMEOUT = 20  # seconds
+TOKEN_REFRESH_INTERVAL = 1800  # 30 minutes in seconds
+
+# Initialize Tesseract
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+
+# Initialize Firebase with error handling
+def initialize_firebase():
+    try:
+        # Check if already initialized
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(FIREBASE_CREDENTIALS)
+            firebase_admin.initialize_app(cred, FIREBASE_CONFIG)
+            print("Firebase initialized successfully")
+        return True
+    except Exception as e:
+        print(f"Failed to initialize Firebase: {e}")
+        return False
+
+if not initialize_firebase():
+    exit(1)
+
+dest_ref = db.reference('location')
+nav_ref = db.reference('start_nav')
+
+# Load YOLO model
+model = YOLO("yolov8n.pt")
+
+class DetectionState:
+    def _init_(self):
+        self.detect_object = False
+        self.detect_text = False
+        self.navigate = False
+        self.object_detected = False
+        self.text_detected = False
+        self.start_detection_time: Optional[float] = None
+        self.expecting_destination = False
+
+    def reset_detection(self):
+        self.detect_object = False
+        self.detect_text = False
+        self.object_detected = False
+        self.text_detected = False
+        self.start_detection_time = None
+
+detection_state = DetectionState()
+
+def check_and_refresh_token():
+    """Check Firebase token validity and refresh if needed"""
+    try:
+        # Test the connection with a simple operation
+        db.reference('connection_test').get()
+    except firebase_exceptions.FirebaseError as e:
+        if 'invalid_grant' in str(e) or 'JWT' in str(e):
+            print("Firebase token expired, refreshing...")
+            try:
+                # Get the default app if it exists
+                default_app = firebase_admin.get_app()
+                firebase_admin.delete_app(default_app)
+                initialize_firebase()
+                print("Firebase token refreshed successfully")
+            except Exception as e:
+                print(f"Failed to refresh Firebase token: {e}")
+
+def periodic_token_check():
+    """Periodically check and refresh Firebase token"""
+    while True:
+        check_and_refresh_token()
+        time.sleep(TOKEN_REFRESH_INTERVAL)
+
+class VoiceCommandListener:
+    def _init_(self):
+        self.recognizer = sr.Recognizer()
+        self.microphone = sr.Microphone()
+        self.command_mapping = {
+            'no': self.handle_text_detection,
+            'ob': self.handle_object_detection,
+            'sto': self.handle_stop_navigation,
+            'star': self.handle_navigation_start
+        }
+
+    def listen_for_command(self):
+        """Continuously listen for voice commands and handle them."""
+        print("Listening for command...")
+        while True:
+            try:
+                with self.microphone as source:
+                    self.recognizer.adjust_for_ambient_noise(source)
+                    print("Listening...")
+                    audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=5)
+
+                command = self.recognizer.recognize_google(audio).lower()
+                print(f"Voice command received: {command}")
+
+                if detection_state.expecting_destination:
+                    self.handle_navigation_destination(command)
+                    continue
+
+                # Find the best matching command
+                for key, handler in self.command_mapping.items():
+                    if key in command:
+                        handler()
+                        break
+
+            except sr.WaitTimeoutError:
+                if detection_state.expecting_destination:
+                    print("Timeout waiting for destination")
+                    detection_state.expecting_destination = False
+                    cv2.destroyWindow("Voice Command")
+                continue
+            except sr.UnknownValueError:
+                print("Could not understand the audio.")
+            except sr.RequestError as e:
+                print(f"Error with the speech recognition service: {e}")
+
+    def handle_text_detection(self):
+        """Handle text detection command."""
+        print("Command 'note' recognized.")
+        detection_state.detect_text = True
+        detection_state.reset_detection()
+
+    def handle_object_detection(self):
+        """Handle object detection command."""
+        print("Command 'detect object' recognized.")
+        detection_state.detect_object = True
+        detection_state.reset_detection()
+        detection_state.start_detection_time = time.time()
+
+    def handle_stop_navigation(self):
+        """Handle stop navigation command."""
+        print("Command 'stop navigation' recognized.")
+        detection_state.navigate = False
+        self.safe_firebase_set(nav_ref, False)
+
+    def handle_navigation_start(self):
+        """Handle navigation start command."""
+        print("Command 'navigate' recognized. Please say your destination.")
+        detection_state.expecting_destination = True
+        # Show visual feedback
+        blank_image = np.zeros((100, 600, 3), dtype=np.uint8)
+        cv2.putText(blank_image, "Say Destination", (50, 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.imshow("Voice Command", blank_image)
+        cv2.waitKey(1)
+
+    def handle_navigation_destination(self, destination: str):
+        """Handle the navigation destination input."""
+        print(f"Destination received: {destination}")
+        
+        # Validate destination
+        if not destination or len(destination) > 50:
+            print("Invalid destination")
+            detection_state.expecting_destination = False
+            cv2.destroyWindow("Voice Command")
+            return
+
+        try:
+            # Set destination with retry
+            if (self.safe_firebase_set(dest_ref, destination) and 
+                self.safe_firebase_set(nav_ref, True)):
+                detection_state.navigate = True
+                detection_state.expecting_destination = False
+                print(f"Navigation to {destination} started")
+                
+                # Close the visual feedback window
+                cv2.destroyWindow("Voice Command")
+                
+                # Show confirmation
+                blank_image = np.zeros((100, 600, 3), dtype=np.uint8)
+                cv2.putText(blank_image, f"Going to: {destination}", (50, 50), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                cv2.imshow("Navigation Confirmation", blank_image)
+                cv2.waitKey(2000)  # Show for 2 seconds
+                cv2.destroyWindow("Navigation Confirmation")
+            else:
+                raise Exception("Failed to set navigation destination in Firebase")
+
+        except Exception as e:
+            print(f"Error setting navigation destination: {e}")
+            detection_state.expecting_destination = False
+            cv2.destroyWindow("Voice Command")
+            
+            # Show error message
+            blank_image = np.zeros((100, 600, 3), dtype=np.uint8)
+            cv2.putText(blank_image, "Error: Try Again", (50, 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            cv2.imshow("Error", blank_image)
+            cv2.waitKey(2000)
+            cv2.destroyWindow("Error")
+
+    def safe_firebase_set(self, ref, value, max_retries=3):
+        """Safely set Firebase value with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                ref.set(value)
+                return True
+            except firebase_exceptions.FirebaseError as e:
+                if attempt == max_retries - 1:
+                    print(f"Failed to set Firebase value after {max_retries} attempts: {e}")
+                    return False
+                print(f"Firebase error (attempt {attempt + 1}): {e}")
+                time.sleep(1)
+                check_and_refresh_token()
+        return False
+
+class ImageProcessor:
+    @staticmethod
+    def show_image(img: np.ndarray) -> None:
+        """Display the image in a window."""
+        cv2.imshow("ESP32 CAM Video Stream", img)
+        cv2.waitKey(1)
+
+    @staticmethod
+    def preprocess_image(img: np.ndarray, target_size: Tuple[int, int] = (640, 480)) -> np.ndarray:
+        """Resize and convert image for processing."""
+        return cv2.resize(img, target_size)
+
+    @staticmethod
+    def detect_text(img: np.ndarray) -> Optional[np.ndarray]:
+        """Perform text detection using Tesseract OCR."""
+        processed_img = ImageProcessor.preprocess_image(img)
+        gray = cv2.cvtColor(processed_img, cv2.COLOR_BGR2GRAY)
+        
+        custom_config = r'--oem 3 --psm 6'
+        text = pytesseract.image_to_string(gray, config=custom_config)
+        
+        if text.strip():
+            print(f"Detected text: {text}")
+            detection_state.text_detected = True
+            ImageProcessor.send_to_server(text)
+            
+            boxes = pytesseract.image_to_boxes(gray)
+            for b in boxes.splitlines():
+                b = b.split()
+                x, y, w, h = int(b[1]), int(b[2]), int(b[3]), int(b[4])
+                cv2.rectangle(processed_img, (x, processed_img.shape[0] - y), 
+                             (w, processed_img.shape[0] - y - h), (0, 255, 0), 2)
+            
+            return processed_img
+        return None
+
+    @staticmethod
+    def detect_objects(img: np.ndarray) -> Optional[np.ndarray]:
+        """Perform object detection using YOLO."""
+        processed_img = ImageProcessor.preprocess_image(img)
+        
+        if (detection_state.start_detection_time and 
+            (time.time() - detection_state.start_detection_time) >= DETECTION_TIMEOUT):
+            print("Stopping object detection after timeout.")
+            detection_state.detect_object = False
+            return None
+        
+        results = model(processed_img)
+        detected_objects = []
+        
+        for r in results:
+            processed_img = r.plot()
+            detected_objects.extend([model.names[int(box.cls)] for box in r.boxes])
+        
+        if detected_objects:
+            detection_text = ", ".join(detected_objects)
+            print(f"Detected objects: {detection_text}")
+            detection_state.object_detected = True
+            ImageProcessor.send_to_server(detection_text)
+        
+        return processed_img
+
+    @staticmethod
+    def send_to_server(text: str) -> None:
+        """Send detected text to ESP8266 server."""
+        try:
+            response = requests.get(f"{ESP8266_SERVER_URL}?value={text}", timeout=5)
+            if response.status_code == 200:
+                print("Text sent to server successfully.")
+            else:
+                print(f"Failed to send text. Status code: {response.status_code}")
+        except requests.RequestException as e:
+            print(f"Error sending text to server: {e}")
+
+async def stream_video():
+    """Handle the video stream from ESP32."""
+    try:
+        async with websockets.connect(ESP32_IP, open_timeout=10, close_timeout=10) as websocket:
+            print("Connected to ESP32 CAM WebSocket")
+            await websocket.send(str(CAM_NO))
+
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                frame_count = 0
+                while True:
+                    try:
+                        frame = await websocket.recv()
+                        if not frame:
+                            print("Received empty frame")
+                            continue
+
+                        np_array = np.frombuffer(frame, dtype=np.uint8)
+                        img = cv2.imdecode(np_array, cv2.IMREAD_COLOR)
+
+                        if img is None:
+                            print("Failed to decode the frame")
+                            continue
+
+                        frame_count += 1
+                        processed_img = img.copy()
+
+                        if frame_count % 10 == 0:
+                            if detection_state.detect_text:
+                                processed_img = ImageProcessor.detect_text(img) or processed_img
+                            elif detection_state.detect_object:
+                                processed_img = ImageProcessor.detect_objects(img) or processed_img
+
+                        executor.submit(ImageProcessor.show_image, processed_img)
+
+                    except Exception as e:
+                        print(f"Error receiving frame: {e}")
+                        break
+    except asyncio.TimeoutError:
+        print("Connection to ESP32 timed out")
+    except Exception as e:
+        print(f"Error in video stream: {e}")
+
+def start_voice_command_listener():
+    """Start the voice command listener in a separate thread."""
+    listener = VoiceCommandListener()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_in_executor(None, listener.listen_for_command)
+
+def main():
+    """Main function to start the application."""
+    # Start token refresh thread
+    token_thread = threading.Thread(target=periodic_token_check, daemon=True)
+    token_thread.start()
+    
+    # Start voice command listener
+    start_voice_command_listener()
+    
+    # Create and run event loop for video streaming
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(stream_video())
+    except KeyboardInterrupt:
+        print("Shutting down...")
+    finally:
+        loop.close()
+
+if _name_ == "_main_":
+    main()
