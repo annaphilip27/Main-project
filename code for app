@@ -1,0 +1,290 @@
+package com.example.myapplicationnew;
+
+import static android.Manifest.permission.RECORD_AUDIO;
+
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.net.Uri;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.MediaStore;
+import android.speech.RecognitionListener;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
+import android.speech.tts.TextToSpeech;
+import android.util.Log;
+import android.view.View;
+import android.widget.EditText;
+import android.widget.ImageView;
+import android.widget.ProgressBar;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+
+import com.google.ai.client.generativeai.GenerativeModel;
+import com.google.ai.client.generativeai.java.GenerativeModelFutures;
+import com.google.ai.client.generativeai.type.Content;
+import com.google.ai.client.generativeai.type.GenerateContentResponse;
+import com.google.android.gms.tasks.OnFailureListener;
+import com.google.android.gms.tasks.OnSuccessListener;
+import com.google.android.gms.tasks.Task;
+import com.google.common.util.concurrent.FutureCallback;
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.ListenableFuture;
+import com.google.mlkit.vision.common.InputImage;
+import com.google.mlkit.vision.text.Text;
+import com.google.mlkit.vision.text.TextRecognition;
+import com.google.mlkit.vision.text.TextRecognizer;
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.concurrent.Executor;
+
+public class MainActivity extends AppCompatActivity {
+
+    private static final int PICK_IMAGE_REQUEST = 2;
+    private TextView textView;
+    private EditText editText;
+    private ImageView imageView;
+    private ProgressBar progressBar;
+
+    private Uri imageUri;
+    private Bitmap selectedImageBitmap = null;
+    private String stringOutput = "";
+
+    private TextToSpeech textToSpeech;
+    private SpeechRecognizer speechRecognizer;
+    private Intent speechIntent;
+    private TextRecognizer textRecognizer;
+
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+        ActivityCompat.requestPermissions(this, new String[]{RECORD_AUDIO}, PackageManager.PERMISSION_GRANTED);
+
+
+        textView = findViewById(R.id.textView);
+        editText = findViewById(R.id.editText);
+        imageView = findViewById(R.id.imageView);
+        progressBar = findViewById(R.id.progressBar);
+        progressBar.setVisibility(View.INVISIBLE);
+
+
+        textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+        textToSpeech = new TextToSpeech(getApplicationContext(), i -> textToSpeech.setSpeechRate(0.8f));
+
+        // Configure speech recognition intent
+        speechIntent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        speechIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+
+        // Clicking ImageView → Open Gallery
+        imageView.setOnClickListener(view -> {
+            Intent galleryIntent = new Intent();
+            galleryIntent.setAction(Intent.ACTION_GET_CONTENT);
+            galleryIntent.setType("image/*");
+            startActivityForResult(galleryIntent, PICK_IMAGE_REQUEST);
+        });
+
+        // Initialize speech recognizer
+        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
+        speechRecognizer.setRecognitionListener(new RecognitionListener() {
+            @Override
+            public void onReadyForSpeech(Bundle bundle) {}
+
+            @Override
+            public void onBeginningOfSpeech() {}
+
+            @Override
+            public void onRmsChanged(float v) {}
+
+            @Override
+            public void onBufferReceived(byte[] bytes) {}
+
+            @Override
+            public void onEndOfSpeech() {}
+
+            @Override
+            public void onError(int i) {}
+
+            @Override
+            public void onResults(Bundle bundle) {
+                ArrayList<String> matches = bundle.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                if (matches != null) {
+                    String spokenText = matches.get(0);
+                    editText.setText(spokenText);
+
+                    boolean isImageQuery = spokenText.toLowerCase().contains("analyze this image") ||
+                            spokenText.toLowerCase().contains("what is in this image") ||
+                            spokenText.toLowerCase().contains("describe this picture");
+
+                    if (isImageQuery && selectedImageBitmap != null) {
+                        textView.setText("Analyzing the selected image...");
+                        processWithGemini(spokenText, selectedImageBitmap);
+                    } else {
+                        sendToGemini(spokenText);
+                    }
+                }
+            }
+
+            @Override
+            public void onPartialResults(Bundle bundle) {}
+
+            @Override
+            public void onEvent(int i, Bundle bundle) {}
+        });
+    }
+
+    // Clicking "Assist" → Start voice assistant
+    public void buttonAssist(View view) {
+        if (textToSpeech.isSpeaking()) {
+            textToSpeech.stop();
+            return;
+        }
+
+        textView.setText("Listening...");
+        speechRecognizer.startListening(speechIntent);
+    }
+
+    // Handle selected image from gallery
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == PICK_IMAGE_REQUEST && resultCode == RESULT_OK && data != null) {
+            imageUri = data.getData();
+            imageView.setImageURI(imageUri);
+
+            try {
+                selectedImageBitmap = MediaStore.Images.Media.getBitmap(getContentResolver(), imageUri);
+                textView.setText("Image selected. Say 'Analyze this image' to process it.");
+                recognizeText();
+            } catch (IOException e) {
+                textView.setText("Error loading image: " + e.getMessage());
+            }
+        }
+
+    }
+
+    private void recognizeText() {
+        if (imageUri != null) {
+            try {
+                InputImage inputImage = InputImage.fromFilePath(MainActivity.this, imageUri);
+
+                Task<Text> result = textRecognizer.process(inputImage)
+                        .addOnSuccessListener(new OnSuccessListener<Text>() {
+                            @Override
+                            public void onSuccess(Text text) {
+                                String recognizedText = text.getText(); // ✅ Correct variable name
+                                textView.setText(recognizedText);
+
+                                if (!recognizedText.isEmpty()) {
+                                    textToSpeech.speak(recognizedText, TextToSpeech.QUEUE_FLUSH, null, null);
+                                } else {
+                                    Toast.makeText(MainActivity.this, "No text found in image.", Toast.LENGTH_SHORT).show();
+                                }
+                            }
+                        })
+                        .addOnFailureListener(new OnFailureListener() {
+                            @Override
+                            public void onFailure(@NonNull Exception e) {
+                                Toast.makeText(MainActivity.this, e.getMessage(), Toast.LENGTH_SHORT).show();
+                            }
+                        });
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+
+
+
+
+    // Convert Bitmap to ByteArray for Gemini
+    private byte[] bitmapToByteArray(Bitmap bitmap) {
+        ByteArrayOutputStream stream = new ByteArrayOutputStream();
+        bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream);
+        return stream.toByteArray();
+    }
+
+    // Process image with Gemini
+    private void processWithGemini(String stringInput, Bitmap imageBitmap) {
+        if (imageBitmap == null) {
+            textView.setText("⚠️ No image selected!");
+            return;
+        }
+
+        // ✅ Display the selected image in the UI for verification
+        imageView.setImageBitmap(imageBitmap);
+        textView.setText("✅ Image selected. Processing...");
+
+        Log.d("AI_DEBUG", "Analyzing selected image...");
+
+        GenerativeModel gm = new GenerativeModel("gemini-pro-vision", "YOUR_API_KEY");
+        GenerativeModelFutures model = GenerativeModelFutures.from(gm);
+
+        Content content = new Content.Builder()
+                .addText(stringInput)
+                .addImage(imageBitmap) // ✅ Ensure the correct image is sent
+                .build();
+
+        ListenableFuture<GenerateContentResponse> response = model.generateContent(content);
+
+        Executor executor = (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P)
+                ? this.getMainExecutor()
+                : command -> new Handler(Looper.getMainLooper()).post(command);
+
+        Futures.addCallback(response, new FutureCallback<GenerateContentResponse>() {
+            @Override
+            public void onSuccess(GenerateContentResponse result) {
+                stringOutput = result.getText();
+                textView.setText(stringOutput);
+                textToSpeech.speak(stringOutput, TextToSpeech.QUEUE_FLUSH, null, null);
+            }
+
+            @Override
+            public void onFailure(Throwable t) {
+                textView.setText("Error: " + t.toString());
+            }
+        }, executor);
+    }
+
+
+    // Send text to Gemini AI
+    private void sendToGemini(String input) {
+        textView.setText("Processing...");
+
+        GenerativeModel gm = new GenerativeModel("gemini-pro", "AIzaSyAvdaI0M2yTqZGEwyJX9NglntHGNmEjENE");
+        GenerativeModelFutures model = GenerativeModelFutures.from(gm);
+
+        Content content = new Content.Builder().addText(input).build();
+        ListenableFuture<GenerateContentResponse> response = model.generateContent(content);
+
+        Executor executor = (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P)
+                ? this.getMainExecutor()
+                : command -> new Handler(Looper.getMainLooper()).post(command);
+
+        Futures.addCallback(response, new FutureCallback<GenerateContentResponse>() {
+            @Override
+            public void onSuccess(GenerateContentResponse result) {
+                stringOutput = result.getText();
+                textView.setText(stringOutput);
+                textToSpeech.speak(stringOutput, TextToSpeech.QUEUE_FLUSH, null, null);
+            }
+
+            @Override
+            public void onFailure(Throwable t) {
+                textView.setText("Error: " + t.toString());
+            }
+        }, executor);
+    }
+}
